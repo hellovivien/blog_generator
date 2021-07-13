@@ -1,70 +1,95 @@
-import streamlit as st
-from transformers import pipeline, set_seed
+
+import transformers
 import random
 import requests
 import json
 from fake_useragent import UserAgent
 import people_also_ask
-import time
+import asyncio
+from motor.motor_asyncio import AsyncIOMotorClient
+from odmantic import AIOEngine, Model, EmbeddedModel
+from typing import List
+from datetime import datetime
+
+loop = asyncio.new_event_loop()
+asyncio.set_event_loop(loop)
+client = AsyncIOMotorClient("adresse de ta base mongodb: https://www.mongodb.com/try")
+engine = AIOEngine(motor_client=client, database="blog")
 
 
-def generate_blog():
-    MAX_ARTICLES= 5
-    task = st.sidebar.empty()
-    task_details = st.sidebar.empty()
-    prog_bar = st.sidebar.progress(0)
-    subject = st.session_state.subject
-    url = "https://suggestqueries.google.com/complete/search?output=chrome&hl=en&gl=us&q=" + subject
-    ua = UserAgent()
-    headers = {"user-agent": ua.chrome}
-    response = requests.get(url, headers=headers, verify=False)
-    suggestions = json.loads(response.text)
-    related_words = suggestions[1]
-    related_questions = []
-    task.markdown("**Find article titles from google...**")
-    for i, word in enumerate(related_words):
-        if len(related_questions) < MAX_ARTICLES:
-            prog_bar.progress(i/len(related_words))
-            # st.markdown('**{}**'.format(word))
-            questions = people_also_ask.get_related_questions(word, 5)
-            for question in questions:
-                if question not in related_questions:
-                    st.success(question)
-                    related_questions.append(question)
-                    task_details.markdown('**{}** title(s)'.format(len(related_questions)))
+class Article(EmbeddedModel):
+    title: str
+    content: str
 
-    if len(related_questions) > 0:            
-        task.markdown("**Generate articles with GPT2...**")
-        st.markdown('<hr>', unsafe_allow_html=True)
-        generator = pipeline('text-generation', model='gpt2')
-        set_seed(42)
-        st.session_state.articles = {}
-        related_questions = related_questions[0:5]
+class ArticleGenerator(EmbeddedModel):
+    model_name: str    
+
+class Blog(Model):
+    title: str
+    keywords: List[str]
+    questions: List[str]
+    generator: ArticleGenerator
+    articles: List[Article]
+    created_at: datetime
+
+class BlogGenerator():
+
+    query_url = 'https://suggestqueries.google.com/complete/search?output=chrome&hl=en&gl=us&q='
+    
+    def __init__(self, topic, model_name, max_articles=5, max_length=300, max_questions_by_keyword=5):
+        self.topic = topic
+        self.max_articles = max_articles
+        self.max_length = max_length
+        self.max_questions_by_keyword = max_questions_by_keyword
+        self.generator = ArticleGenerator(model_name=model_name)
+        self.articles = []
+        self.related_questions = []
+        self.keywords = []
+
+    def get_keywords(self):
+        ua = UserAgent()
+        headers = {"user-agent": ua.chrome}
+        url = self.query_url+self.topic 
+        response = requests.get(url, headers=headers, verify=False)
+        suggestions = json.loads(response.text)
+        self.keywords = suggestions[1]
+        return len(self.keywords) != 0      
+
+    def get_questions(self):
+        for keyword in enumerate(self.keywords):
+            print('Generate question for {}'.format(keyword))
+            if len(self.related_questions) < self.max_articles:
+                questions_asked = people_also_ask.get_related_questions(keyword, self.max_questions_by_keyword)
+                for question in questions_asked:
+                    if question not in self.related_questions:
+                        self.related_questions.append(question)
+                        print(question)
+        return len(self.related_questions) != 0
+
+    def generate_articles(self):       
+        print("**Generate articles with GPT2...**")
+        generator = transformers.pipeline('text-generation', model='gpt2')
+        transformers.set_seed(42)
+        related_questions = self.related_questions[0:self.max_articles]
         for i,question in enumerate(related_questions):
-            prog_bar.progress(i/len(related_questions))
-            article = generator(question, max_length=300, num_return_sequences=2)
-            st.session_state.articles[question] = article[0]['generated_text'][len(question):]
-            st.success('article {}: {}'.format(i+1, question))
-            task_details.markdown('**{}** article(s)'.format(i+1))
-        st.balloons()
-        time.sleep(2)
-        st.experimental_rerun()
-    else:
-        st.error('Your title is not good')
+            content = generator(question, max_length=self.max_length, num_return_sequences=2)
+            content = content[0]['generated_text'][len(question):]
+            self.articles.append(Article(title=question, content=content))
+            print('{}/{} article(s)'.format(i+1, self.max_articles))
+        return len(self.articles) != 0
 
+    def pipeline(self):
+        if self.get_keywords():
+            if self.get_questions():
+                if self.generate_articles():
+                    return True
+        return False
 
+async def main():
+    gen = BlogGenerator('restaurant paris', 'gpt2', max_articles=4)
+    if gen.pipeline():
+        blog = Blog(title=gen.topic, keywords=gen.keywords, questions=gen.related_questions, generator=gen.generator, articles=gen.articles, created_at=datetime.now())
+        await engine.save(blog)
 
-def get_article(question):
-    st.markdown('## {}'.format(question))
-    st.markdown(st.session_state.articles[question])  
-
-if not 'articles' in st.session_state:
-    with st.form('blog_generator'):
-        subject = st.text_input('Title',key='subject',value='covid vaccine')
-        st.form_submit_button('Generate your blog', on_click=generate_blog)           
-else:
-    for question in st.session_state.articles.keys():
-        st.sidebar.button(question, key=str(random.random()), on_click=get_article, args=(question,))
-
-
-
+if __name__ == "__main__":
+    loop.run_until_complete(main())
